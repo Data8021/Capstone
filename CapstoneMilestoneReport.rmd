@@ -1,0 +1,330 @@
+---
+title: "Capstone Milestone Report"
+author: ""
+date: "3/16/2016"
+output: html_document
+---
+
+## Summary
+The report explains the exploratory analysis and initial modeling done as part of Courera's Data Science Specialization Capstone project to develop a word prediction application.
+
+## Loading Data
+
+Data was provided by Swiftkey, downloaded and unziped.
+
+```{r, eval=FALSE}
+fileLoc<-"http://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip"
+dest<-"data/Coursera-SwiftKey.zip"
+download.file(fileLoc, dest)
+unzip(dest, exdir = "data")
+```
+
+## Processing Data
+
+First, we read in the blogs, twitter and news text files. 
+
+```{r, eval=FALSE}
+con <- file("data/final/en_US/en_US.blogs.txt", "r")
+blogsData <- readLines(con, encoding = "UTF-8", warn = FALSE)
+close(con)
+
+con <- file("data/final/en_US/en_US.twitter.txt", "r")
+twitterData <- readLines(con, encoding = "UTF-8", warn = FALSE)
+close(con)
+
+con <- file("data/final/en_US/en_US.news.txt", open="rb")
+newsData <- readLines(con, encoding="UTF-8", warn = FALSE)
+close(con)
+```
+
+## Initial Exploration of the Data
+
+We initially evaluate the raw data files looking at the number of lines, number of words and the average number of words per line. 
+
+```{r, eval=FALSE}
+suppressMessages(suppressWarnings(library(stringi)))
+                 
+blogWords <- stri_count_words(blogsData)
+newsWords <- stri_count_words(newsData)
+twitterWords <- stri_count_words(twitterData)
+summary_table <- data.frame(dataSource = c("blogs","news","twitter"),
+                            numLines = c(length(blogsData),length(newsData),length(twitterData)),
+                            numWords = c(sum(blogWords),sum(newsWords),sum(twitterWords)),
+                            meanNumWords = c(mean(blogWords),mean(newsWords),mean(twitterWords)))
+summary_table
+```
+```{r, echo=FALSE}
+load("data/summaryTable.Rda")
+summary_table
+```
+
+## Sample the Data
+
+In order to work with a more manageable dataset, we take a 1% sample of the lines in all three files and combine into a single sample dataset.
+
+```{r, echo=FALSE}
+## First, we load the data files
+load("data/blogsData.Rda")
+load("data/newsData.Rda")
+load("data/twitterData.Rda")
+```
+```{r, cache=TRUE}
+## Take 1% sample
+set.seed(1492)
+blogsData <- sample(blogsData, length(blogsData) * 0.01)
+newsData <- sample(newsData, length(newsData) * 0.01)
+twitterData <- sample(twitterData, length(twitterData) * 0.01)
+
+## Combine into single dataset
+sampleData <- c(blogsData, twitterData, newsData)
+```
+
+## Creating a Corpus and Cleaning the Data
+
+We start by removing non english characters from the sampled and expanding contractions.
+```{r, cache=TRUE}
+sampleData <- iconv(sampleData, "latin1", "ASCII", sub="")
+
+sampleData <- gsub("can't", "can not", sampleData, perl = TRUE)
+sampleData <- gsub("let's", "let us", sampleData, perl = TRUE)
+sampleData <- gsub("'re", " are", sampleData, perl = TRUE)
+sampleData <- gsub("'ll", " will", sampleData, perl = TRUE)
+sampleData <- gsub("'ve", " have", sampleData, perl = TRUE)
+sampleData <- gsub("'d", " had", sampleData, perl = TRUE)
+sampleData <- gsub("n't", " not", sampleData, perl = TRUE)
+sampleData <- gsub("'s", " is", sampleData, perl = TRUE)
+sampleData <- gsub("'m", " am", sampleData, perl = TRUE)
+```
+
+We then create a corpus using the `tm` package, and begin to clean the data by making everything lower case, and removing punctuations, stopwords and numbers.
+
+```{r, cache=TRUE}
+suppressMessages(suppressWarnings(library(tm)))
+
+## Create corpus
+sampleCorpus = Corpus(VectorSource(sampleData))
+
+## Clean corpus
+cleanCorp <- tm_map(sampleCorpus, content_transformer(tolower))
+cleanCorp <- tm_map(cleanCorp, removePunctuation)
+cleanCorp <- tm_map(cleanCorp, removeWords, stopwords("english"))
+cleanCorp <- tm_map(cleanCorp, removeNumbers)
+```
+
+We then remove profanity using data from: http://www.bannedwordlist.com.
+
+```{r, cache=TRUE}
+fileLoc<-"http://www.freewebheaders.com/wordpress/wp-content/uploads/full-list-of-bad-words-banned-by-google-txt-file.zip"
+dest<-"data/bannedwords.zip"
+download.file(fileLoc, dest)
+unzip(dest, exdir = "data")
+profanity <- readLines("data/full-list-of-bad-words-banned-by-google-txt-file_2013_11_26_04_53_31_867.txt", warn = FALSE)
+cleanCorp <- tm_map(cleanCorp, removeWords, profanity)
+```
+
+Finally, we remove extra whitespace.
+
+```{r, cache=TRUE}
+cleanCorp <- tm_map(cleanCorp, stripWhitespace)
+```
+
+## Tokenization and N-Gram Analysis
+
+We start the tokenization work by creating a series of functions to tokenize the corpus using the `RWeka` package.
+
+```{r, cache=TRUE}
+unigramTokenizer <- function(x) {RWeka::NGramTokenizer(x, RWeka::Weka_control(min = 1, max = 1))}
+bigramTokenizer <- function(x) {RWeka::NGramTokenizer(x, RWeka::Weka_control(min = 2, max = 2))}
+trigramTokenizer <- function(x) {RWeka::NGramTokenizer(x, RWeka::Weka_control(min = 3, max = 3))}
+```
+
+Then we create document term matrices using the unigram, bigram and trigram tokenizer functions.
+
+```{r, cache=TRUE}
+unigramTDM <- TermDocumentMatrix(cleanCorp,
+                                 control = list(tokenize = unigramTokenizer))
+
+bigramTDM <- TermDocumentMatrix(cleanCorp,
+                                control = list(tokenize = bigramTokenizer))
+                                 
+trigramTDM <- TermDocumentMatrix(cleanCorp,
+                                 control = list(tokenize = trigramTokenizer))
+```
+
+We are going to use a funciton to help extract the frequency data on the ngrams, and sort to identify the highest frequency words, word pairs and word triplets.
+
+```{r, cache=TRUE}
+tdmFreqSort <- function(tdm) {
+    suppressMessages(suppressWarnings(library(Matrix)))
+    
+    ## create sparse matrix
+    tdmMatrix <- sparseMatrix(i=tdm$i, j=tdm$j, x=tdm$v)
+    
+    ## Create dataframe and sort by 
+    tdmDF <- data.frame(terms = tdm$dimnames$Terms, freq = rowSums(tdmMatrix))
+    tdmDF <- tdmDF[order(tdmDF$freq, decreasing = TRUE),]
+    
+    ## Clean up garbage
+    gc()
+    
+    return(tdmDF)
+}
+```
+
+We then apply the frequency sort function on our three term document matrices.
+
+```{r, cache=TRUE}
+unigrams <- tdmFreqSort(unigramTDM)
+bigrams <- tdmFreqSort(bigramTDM)
+trigrams <- tdmFreqSort(trigramTDM)
+```
+
+## Exploratory Analysis
+
+First, we look at the unigrams.  We have identified the 15 most common unigrams, and provided a histrogram of word frequencies.  Due to the very large number of words with fewer than 10 uses in the entire corpus (`r nrow(subset(unigrams, freq < 10))` of the `r nrow(unigrams)` total words), we have only plotted word frequencies with a minimum of 10 uses.
+
+```{r, fig.width=9, fig.align="center"}
+suppressMessages(suppressWarnings(library(ggplot2)))
+suppressMessages(suppressWarnings(library(Rmisc)))
+
+uniComPlot <- ggplot(head(unigrams, 15), aes(x=reorder(terms,freq), y=freq,
+                                             fill=freq)) +
+                    geom_bar(stat="identity") +
+                    coord_flip() +
+                    labs(x = "", y="Frequency", title="Most Common Unigrams") +
+                    guides(fill=guide_legend(title="Word Frequency",
+                                             reverse=TRUE))
+
+uniHistPlot <- ggplot(subset(unigrams, freq > 9), aes(freq)) +
+                    geom_histogram(binwidth = 10) + 
+                    labs(x = "Word Frequency (minimum 10)", y="Count",
+                         title="Unigram Frequency Histogram")
+
+multiplot(uniComPlot, uniHistPlot, cols=2)
+```
+
+Second, we look at the bigrams.  We have identified the 15 most common two word phrases, and provided a histrogram of phrase frequencies.  Due to the very large number of bigrams with fewer than 5 uses in the entire corpus (`r nrow(subset(bigrams, freq < 5))` of the `r nrow(bigrams)` total two word phrases), we have only plotted phrase frequencies with a minimum of 5 uses.
+
+```{r, fig.width=9, fig.align="center"}
+biComPlot <- ggplot(head(bigrams, 15), aes(x=reorder(terms,freq), y=freq,
+                                           fill=freq)) +
+                    geom_bar(stat="identity") +
+                    coord_flip() +
+                    labs(x = "", y="Frequency", title="Most Common Bigrams") +
+                    guides(fill=guide_legend(title="Word Frequency",
+                                             reverse=TRUE))
+
+biHistPlot <- ggplot(subset(bigrams, freq > 4), aes(freq)) +
+                    geom_histogram(binwidth = 1) + 
+                    labs(x = "Phrase Frequency (minimum 5)", y="Count",
+                         title="Bigram Frequency Histogram")
+
+multiplot(biComPlot, biHistPlot, cols=2)
+```
+
+Finally, we look at the trigrams.  We have identified the 15 most common three word phrases, and provided a histrogram of phrase frequencies.  Due to the very large number of trigrams with only one use in the entire corpus (`r nrow(subset(trigrams, freq < 2))` of the `r nrow(trigrams)` total three word phrases), we have only plotted phrase frequencies with a minimum of 2 uses.
+
+```{r, fig.width=9, fig.align="center"}
+triComPlot <- ggplot(head(trigrams, 15), aes(x=reorder(terms,freq), y=freq,
+                                             fill=freq)) +
+                    geom_bar(stat="identity") +
+                    coord_flip() +
+                    labs(x = "", y="Frequency", title="Most Common Trigrams") +
+                    guides(fill=guide_legend(title="Word Frequency",
+                                             reverse=TRUE))
+
+triHistPlot <- ggplot(subset(trigrams, freq > 1), aes(freq)) +
+                    geom_histogram(binwidth = 1) + 
+                    labs(x = "Phrase Frequency (minimum 2)", y="Count",
+                         title="Trigram Frequency Histogram")
+
+multiplot(triComPlot, triHistPlot, cols=2)
+```
+
+## Coverage Analysis
+
+Thinking ahead to the memory requirements of the predictive algorithm, we want to understand how many words and phrases are necessary to cover some percentage of all word and phrases uses.  To do this, we first create a function that will loop through the frequency sorted data frame until the frequency of the word or phrase usage is more than the specified coverage.
+
+```{r}
+getWordCoverage <- function (ngramDF, coverage) {
+    
+    ## Initialize frequency variables
+    frequency <- 0
+    requiredFrequency <- coverage * sum(ngramDF$freq)
+    
+    ## Begin iterating through dataframe
+    for (i in 1:nrow(ngramDF)) {
+        
+        ## Test if frequency is bigger than required coverage
+        if (frequency >= requiredFrequency) {
+            return (i)
+            }
+    
+    ## Increase frequency
+    frequency <- frequency + ngramDF[i, "freq"]
+    
+    }
+  
+    return (i)
+}
+```
+
+We want to examine coverage of each ngram dataframe from 10% to 90% coverage to see how extensive a word/phrase list we will need in the predictive algorithm.  We start by creating a function that will return a dataframe of how many words its takes to reach various levels of coverage.
+
+```{r}
+createCoverageDF <- function(ngramDF) {
+    
+    ## Initialize variables
+    x <- seq(0.1, 0.9, by = 0.1)
+    y <- vector() 
+    
+    ## Loop through x
+    for (i in x) {
+  
+        y[i*10] <- getWordCoverage(ngramDF, i)
+        
+    }
+    
+    coverage <- data.frame(cov = x, numWords = y)
+    return(coverage)
+    
+}
+```
+
+Then we run that funciton against the unigram, bigram and trigram dataframes.
+
+```{r, cache=TRUE}
+uniCov <- createCoverageDF(unigrams)
+biCov <- createCoverageDF(bigrams)
+triCov <- createCoverageDF(trigrams)
+```
+
+Finally, we plot the results of this analysis.
+```{r, fig.width=9, fig.align="center"}
+
+## Unigram plot
+uniCovPlot <- ggplot(uniCov, aes(x = cov, y = numWords)) +
+    geom_line(size=1.5) +
+    labs(x = "Coverage", y="Number of Words",
+         title="Unigrams Required\nto Reach\nDictionary Coverage")
+
+## Bigram plot
+biCovPlot <- ggplot(biCov, aes(x = cov, y = numWords)) +
+    geom_line(size=1.5) +
+    labs(x = "Coverage", y="Number of Phrases",
+         title="Bigrams Required\nto Reach\nDictionary Coverage")
+
+## Trigram plot
+triCovPlot <- ggplot(triCov, aes(x = cov, y = numWords)) +
+    geom_line(size=1.5) +
+    labs(x = "Coverage", y="Number of Phrases",
+         title="Trigrams Required\nto Reach\nDictionary Coverage")
+
+multiplot(uniCovPlot, biCovPlot, triCovPlot, cols=3)
+```
+
+We can see that the unigram plot shows an exponential increase in coverage, so that we are likely to be able to remove a large number of words at the tail, which have small frequencies.  For the bigrams and trigrams, we can see that the relationship of more linear, meaning that we might not be able to significantly reduce the phrase library without compromsing the accuracy of our predictive algorithm.  We will further examine this issue during the model development and testing.
+
+## Next Steps
+
+We will start by cleaning up the above data conditioning to ensure that we are modeling off the most accurage picture of word and phrase usage possible. We will then build several models to predict the next word based on the previous one or two inputted words.  We will divide the bigram and trigram datasets into training and testing portions, to ensure that we do not overfit the models. Finally, we will program the best models into a `shiny app`. 
